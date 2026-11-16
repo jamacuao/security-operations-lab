@@ -1,0 +1,37 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Run redact-util in check mode over every file version in the commits
+# being pushed. Any finding blocks the push. See REDACTION.md.
+
+root=$(git rev-parse --show-toplevel) || exit 1
+redact="$root/tools/redact-util"
+zero=0000000000000000000000000000000000000000
+status=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # A deleted ref pushes no content.
+    [ "$local_sha" = "$zero" ] && continue
+    if [ "$remote_sha" = "$zero" ]; then
+        commits=$(git rev-list "$local_sha" --not --remotes)
+    else
+        commits=$(git rev-list "$remote_sha..$local_sha")
+    fi
+    for c in $commits; do
+        # -m lists what a merge commit changed against each parent, so
+        # content introduced by the merge itself is checked as well.
+        git diff-tree -m --no-commit-id --name-only -r --root \
+            --diff-filter=AM "$c" | sort -u |
+        while IFS= read -r path; do
+            if ! git show "$c:$path" |
+                python3 "$redact" --check --name "$path" -; then
+                echo "pre-push: finding in $path at ${c%"${c#???????}"}" >&2
+                exit 1
+            fi
+        done || status=1
+    done
+done
+
+if [ "$status" -ne 0 ]; then
+    echo "pre-push: push blocked. Fix the commits, then push again." >&2
+fi
+exit "$status"

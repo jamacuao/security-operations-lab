@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Substitute sensitive values in captured output, per REDACTION.md.
+
+Usage:
+    redact-util RAW OUT          write a substituted copy of RAW to OUT
+    redact-util --check FILE...  report values that would be substituted;
+                                 exit 1 if any are found
+
+Use "-" for standard input. --name PATH labels standard input in
+reports and applies the skip list to it. UTF-16 input with a byte-order
+mark is read as text. Check mode names each image it skips, and refuses
+any other binary file.
+"""
+
+import argparse
+import hashlib
+import hmac
+import ipaddress
+import os
+import re
+import sys
+
+HOME = os.path.expanduser("~")
+SALT_PATH = os.environ.get("REDACT_SALT", os.path.join(HOME, ".redact-salt"))
+ALLOW_PATH = os.environ.get(
+    "REDACT_ALLOW", os.path.join(HOME, ".redact-allow"))
+LITERALS_PATH = os.environ.get(
+    "REDACT_LITERALS", os.path.join(HOME, ".redact-literals"))
+
+# REDACTION.md holds example patterns and addresses, so it is never read.
+SKIP = {"REDACTION.md"}
+
+LITERAL_TOKENS = {
+    "USER": "[USER]",
+    "HOSTNAME": "[HOSTNAME]",
+    "SSID": "[SSID]",
+    "BSSID": "[BSSID]",
+    "DOMAIN": "example.com",
+    "NAME": "[NAME]",
+    "AUTHOR": "[NAME]",
+    "EMAIL": "[EMAIL]",
+    "OTHER": "[REDACTED]",
+}
+
+# The author's name is kept in these files and on an entry's frontmatter
+# author line, and substituted everywhere else. See REDACTION.md.
+AUTHOR_FILES = {"LICENSE-CODE"}
+RE_AUTHOR_LINE = re.compile(r"^author:\s*\S")
+# Stands in for a kept author name while the other rules run. A NUL byte
+# never reaches the rules, because binary input is refused.
+HOLD = "\x00{}\x00"
+
+CLASS_A = {"private-key", "jwt", "product-key", "lm-nt-hash"}
+
+# GUIDs identical on every Windows install.
+KEEP_GUIDS = {
+    "00000000-0000-0000-0000-000000000000",
+    "31b2f340-016d-11d2-945f-00c04fb984f9",  # Default Domain Policy
+    "6ac1786c-016f-11d2-945f-00c04fb984f9",  # Default DC Policy
+}
+
+KEEP_V4 = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",   # RFC 1918
+    "127.0.0.0/8", "169.254.0.0/16",                   # loopback, link-local
+    "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",  # RFC 5737
+    "0.0.0.0/8", "224.0.0.0/4", "255.255.255.255/32",  # unspecified, multicast
+)]
+KEEP_V4_HOSTS = {ipaddress.ip_address(a) for a in (
+    "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4",
+    "9.9.9.9", "149.112.112.112",                      # anycast resolvers
+)}
+KEEP_V6 = [ipaddress.ip_network(n) for n in (
+    "fe80::/10", "fd00::/8", "::1/128", "::/128",
+    "2001:db8::/32", "ff00::/8",
+)]
+
+DOC_V4 = [ipaddress.ip_network(n) for n in (
+    "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
+
+VIRTUAL_OUIS = {"525400", "00155d", "005056", "000c29"}
+
+RE_PRIVATE_KEY = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.S)
+RE_JWT = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+RE_LMNT = re.compile(r"\b[0-9a-fA-F]{32}:[0-9a-fA-F]{32}\b")
+RE_PRODUCT_KEY = re.compile(r"\b(?:[A-Z0-9]{5}-){4}[A-Z0-9]{5}\b")
+RE_GUID = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+RE_MAC = re.compile(r"\b(?:[0-9A-Fa-f]{2}([:-]))(?:[0-9A-Fa-f]{2}\1){4}"
+                    r"[0-9A-Fa-f]{2}\b")
+RE_MAC_DOTTED = re.compile(r"\b(?:[0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}\b")
+RE_CISCO_SERIAL = re.compile(r"\b[A-Z]{3}[0-9]{4}[A-Z0-9]{4}\b")
+RE_V6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}"
+                   r"(?![\w:])")
+RE_V4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
+RE_BARE32 = re.compile(r"\b[0-9a-fA-F]{32}\b")
+# Terminal escape sequences: CSI (colors, cursor moves), OSC (titles,
+# hyperlinks), and two-byte escapes. A color code ends in a letter, so a
+# value printed right after one would fail every word-boundary test.
+RE_ESCAPE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b[@-Z\\-_]")
+
+
+def fail(msg):
+    print(f"redact-util: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def read_lines(path):
+    if not os.path.exists(path):
+        fail(f"{path} is missing; see tools/README.md")
+    with open(path, encoding="utf-8") as f:
+        return [l.rstrip("\n") for l in f
+                if l.strip() and not l.lstrip().startswith("#")]
+
+
+def load_literals():
+    out = []
+    for line in read_lines(LITERALS_PATH):
+        kind, _, value = line.strip().partition(" ")
+        kind = kind.upper()
+        if kind not in LITERAL_TOKENS or not value.strip():
+            fail(f"bad line in {LITERALS_PATH}: {line!r}")
+        out.append((value.strip(), kind))
+    # Longest first, so a value inside a longer value never wins.
+    out.sort(key=lambda p: len(p[0]), reverse=True)
+    return [(re.compile(r"(?<!\w)" + re.escape(v) + r"(?!\w)", re.I), k)
+            for v, k in out]
+
+
+class Redactor:
+    def __init__(self, salt, allow, literals, author_file=False):
+        self.salt = salt
+        self.allow = {a.strip().lower() for a in allow}
+        self.literals = literals
+        self.authors = [r for r, k in literals if k == "AUTHOR"]
+        self.author_file = author_file
+        self.counts = {}
+        self.findings = []
+        self.bare32 = 0
+
+    def suffix(self, value):
+        mac = hmac.new(self.salt, value.lower().encode(), hashlib.sha256)
+        return mac.hexdigest()[:4]
+
+    def hit(self, rule, lineno, value):
+        self.counts[rule] = self.counts.get(rule, 0) + 1
+        self.findings.append((lineno, rule, value))
+
+    def allowed(self, value):
+        return value.strip().lower() in self.allow
+
+    def sub(self, regex, rule, line, lineno, make):
+        def repl(m):
+            value = m.group(0)
+            if self.allowed(value):
+                return value
+            new = make(m, line)
+            if new is None or new == value:
+                return value
+            self.hit(rule, lineno, value)
+            return new
+        return regex.sub(repl, line)
+
+    def guid(self, m, line):
+        value = m.group(0)
+        if value.lower() in KEEP_GUIDS:
+            return None
+        low = line.lower()
+        kind = ("TENANT-ID" if "tenant" in low else
+                "SUBSCRIPTION" if "subscription" in low else "OBJECT-ID")
+        return f"[{kind} {self.suffix(value)}]"
+
+    def mac(self, value, sep):
+        digits = re.sub(r"[^0-9A-Fa-f]", "", value)
+        low = digits.lower()
+        if low in ("ffffffffffff", "000000000000"):
+            return None
+        if low[:6] in VIRTUAL_OUIS or low[:6] == "01005e":
+            return None
+        if low[:4] == "3333" or low[:10] == "0180c20000":
+            return None
+        x = "xx"
+        if sep == ".":
+            return f"{digits[:4]}.{digits[4:6]}{x}.{x}{x}"
+        return sep.join([digits[0:2], digits[2:4], digits[4:6], x, x, x])
+
+    def v4(self, m, line):
+        try:
+            ip = ipaddress.ip_address(m.group(0))
+        except ValueError:
+            return None
+        if ip in KEEP_V4_HOSTS or any(ip in n for n in KEEP_V4):
+            return None
+        n = int(self.suffix(str(ip)), 16) % 762
+        net = DOC_V4[n // 254]
+        return str(net.network_address + 1 + n % 254)
+
+    def v6(self, m, line):
+        value = m.group(0)
+        if value.count(":") < 2:
+            return None
+        try:
+            ip = ipaddress.ip_address(value)
+        except ValueError:
+            return None
+        if ip.ipv4_mapped:
+            return None
+        eui = self.eui64_mac(ip)
+        if eui is not None and eui[:6] in VIRTUAL_OUIS:
+            eui = None
+        if any(ip in n for n in KEEP_V6):
+            if eui is None:
+                return None
+            # A kept prefix still leaks a MAC through an EUI-64 interface ID.
+            prefix = ipaddress.ip_address(int(ip) >> 64 << 64)
+            return f"{prefix}{self.suffix(str(ip))}".replace(":::", "::")
+        return f"2001:db8::{self.suffix(str(ip))}"
+
+    @staticmethod
+    def eui64_mac(ip):
+        b = ip.packed[8:]
+        if b[3:5] != b"\xff\xfe":
+            return None
+        return bytes([b[0] ^ 2, b[1], b[2], b[5], b[6], b[7]]).hex()
+
+    def redact_line(self, line, lineno, keep_author=False):
+        held = []
+        if keep_author:
+            def hold(m):
+                held.append(m.group(0))
+                return HOLD.format(len(held) - 1)
+            for regex in self.authors:
+                line = regex.sub(hold, line)
+        line = self.sub(RE_JWT, "jwt", line, lineno, lambda m, l: "[JWT]")
+        for regex, kind in self.literals:
+            rule = "author" if kind == "AUTHOR" else "literal"
+            line = self.sub(regex, rule, line, lineno,
+                            lambda m, l, t=LITERAL_TOKENS[kind]: t)
+        line = self.sub(RE_LMNT, "lm-nt-hash", line, lineno,
+                        lambda m, l: "[NTLM-HASH]")
+        line = self.sub(RE_PRODUCT_KEY, "product-key", line, lineno,
+                        lambda m, l: "[PRODUCT-KEY]")
+        line = self.sub(RE_GUID, "guid", line, lineno, self.guid)
+        line = self.sub(RE_MAC, "mac", line, lineno,
+                        lambda m, l: self.mac(m.group(0), m.group(1)))
+        line = self.sub(RE_MAC_DOTTED, "mac", line, lineno,
+                        lambda m, l: self.mac(m.group(0), "."))
+        line = self.sub(RE_CISCO_SERIAL, "serial", line, lineno,
+                        lambda m, l: f"[SERIAL {self.suffix(m.group(0))}]")
+        line = self.sub(RE_V6, "ipv6", line, lineno, self.v6)
+        line = self.sub(RE_V4, "ipv4", line, lineno, self.v4)
+        self.bare32 += len(RE_BARE32.findall(line))
+        for i, value in enumerate(held):
+            line = line.replace(HOLD.format(i), value)
+        return line
+
+    def author_lines(self, lines):
+        """Return the indexes of lines where the author's name is kept."""
+        if self.author_file:
+            return set(range(len(lines)))
+        if not lines or lines[0].strip() != "---":
+            return set()
+        for end in range(1, len(lines)):
+            if lines[end].strip() == "---":
+                return {i for i in range(1, end)
+                        if RE_AUTHOR_LINE.match(lines[i])}
+        return set()
+
+    def redact(self, text):
+        def key_block(m):
+            lineno = text.count("\n", 0, m.start()) + 1
+            self.hit("private-key", lineno, "-----BEGIN ... PRIVATE KEY-----")
+            return "[PRIVATE-KEY]"
+        text = RE_PRIVATE_KEY.sub(key_block, text)
+        lines = text.split("\n")
+        keep = self.author_lines(lines)
+        return "\n".join(self.redact_line(l, i + 1, i in keep)
+                         for i, l in enumerate(lines))
+
+
+# Signatures of the image formats a screenshot is saved in: PNG, JPEG,
+# and GIF. WebP is checked separately, because its signature is split.
+IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
+
+
+def is_image(data):
+    if data.startswith(IMAGE_MAGIC):
+        return True
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+def read_input(path):
+    """Return ("text", text), ("image", None), or ("binary", None)."""
+    data = sys.stdin.buffer.read() if path == "-" else open(path, "rb").read()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        # UTF-16 with a byte-order mark, such as output that Windows
+        # PowerShell 5.1 redirected to a file. The codec reads the mark
+        # to pick the byte order, then drops it.
+        text = data.decode("utf-16", errors="replace")
+    elif is_image(data):
+        return "image", None
+    elif b"\x00" in data:
+        return "binary", None
+    else:
+        text = data.decode("utf-8", errors="replace")
+    if "\x00" in text:
+        return "binary", None
+    # Remove escape sequences before any rule runs. See REDACTION.md,
+    # Substitution grammar.
+    return "text", RE_ESCAPE.sub("", text)
+
+
+def summary(s, label):
+    total = sum(s.counts.values())
+    parts = [f"{k}:{v}" for k, v in sorted(s.counts.items())]
+    print(f"redact-util: {label}: substituted {total}"
+          + (f" ({', '.join(parts)})" if parts else ""), file=sys.stderr)
+    if s.bare32:
+        print(f"redact-util: {label}: review:bare32 {s.bare32}",
+              file=sys.stderr)
+    found_a = sorted(CLASS_A & set(s.counts))
+    if found_a:
+        print(f"redact-util: {label}: CLASS A FOUND ({', '.join(found_a)}). "
+              "Rotate the secret; see REDACTION.md, On exposure.",
+              file=sys.stderr)
+    return bool(found_a)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--name")
+    ap.add_argument("paths", nargs="+")
+    args = ap.parse_args()
+
+    allow = read_lines(ALLOW_PATH)
+    literals = load_literals()
+
+    if args.check:
+        found = refused = False
+        for path in args.paths:
+            label = args.name if (path == "-" and args.name) else path
+            if os.path.basename(label) in SKIP:
+                continue
+            kind, text = read_input(path)
+            if kind == "image":
+                print(f"redact-util: {label}: skipped image; read it by eye",
+                      file=sys.stderr)
+                continue
+            if kind == "binary":
+                print(f"redact-util: {label} is binary; redact-util reads "
+                      "text only", file=sys.stderr)
+                refused = True
+                continue
+            s = Redactor(b"check", allow, literals,
+                         os.path.basename(label) in AUTHOR_FILES)
+            s.redact(text)
+            for lineno, rule, value in s.findings:
+                print(f"{label}:{lineno}: {rule}", file=sys.stderr)
+            if s.bare32:
+                print(f"redact-util: {label}: review:bare32 {s.bare32}",
+                      file=sys.stderr)
+            found = found or bool(s.findings)
+        sys.exit(2 if refused else 1 if found else 0)
+
+    if len(args.paths) != 2:
+        ap.error("substitution takes exactly RAW and OUT")
+    raw, out = args.paths
+    if not os.path.exists(SALT_PATH):
+        fail(f"{SALT_PATH} is missing; see tools/README.md")
+    with open(SALT_PATH, "rb") as f:
+        salt = f.read().strip()
+    if not salt:
+        fail(f"{SALT_PATH} is empty")
+    kind, text = read_input(raw)
+    if kind != "text":
+        fail(f"{raw} is binary; redact-util reads text only")
+    s = Redactor(salt, allow, literals,
+                 os.path.basename(raw) in AUTHOR_FILES)
+    result = s.redact(text)
+    if out == "-":
+        sys.stdout.write(result)
+    else:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(result)
+    sys.exit(3 if summary(s, raw) else 0)
+
+
+if __name__ == "__main__":
+    main()
