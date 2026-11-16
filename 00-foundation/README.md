@@ -46,3 +46,11 @@ routing labs to the netops-notes repository.
 
 | ID | Entry | Tier | Status | Superseded by |
 |---|---|---|---|---|
+| LAB-0001 | [Lab address scheme and target topology](LAB-0001-address-scheme-and-topology/address-scheme-and-topology.md) | L0 | complete | |
+
+## Open gaps
+
+- LAB-0001/guest-ceiling-unmeasured: the ceiling of about five
+  concurrent guests is an estimate.
+- LAB-0001/segment-99-undefined: segment 99 has a range and no rules
+  until HANDLING.md exists.

@@ -55,9 +55,12 @@ demonstrated. This alignment is entirely self-assessed and uncertified.
  
 ## Current stack
  
-As of October 2026, no components have been chosen; LAB-0001 records
-the first choices. Each component chosen will be listed here, with a
-link to the entry that chose it.
+As of November 2026:
+
+| Component | Choice | Chosen in |
+|---|---|---|
+| Lab host | Fedora 45 Workstation, KVM managed through libvirt | In place before the first entry |
+| Lab addressing | `10.20.0.0/16`, one `/24` per segment | [LAB-0001](00-foundation/LAB-0001-address-scheme-and-topology/address-scheme-and-topology.md) |
  
 ## Finding an entry
  
