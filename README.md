@@ -24,19 +24,22 @@ repository:
   utility and the workstation pre-push hook.
 - [`templates/entry.md`](templates/entry.md): Base template for new
   entries.
+
 ## Layers
  
-Each layer assumes the layer before it is in place. Each layer directory
-contains a README documenting the layer's exit criteria, index of
-entries, and open gaps.
+Layers are numbered in dependency order. A layer may rely on any layer
+with a lower number. Each layer directory contains a README documenting
+the layer's exit criteria, index of entries, and open gaps.
  
 | Layer | Scope | CSF 2.0 functions | CIS v8.1 target safeguards | Other frameworks |
 |---|---|---|---|---|
 | `00-foundation/` | Host, hypervisor, storage layout, segmentation and addressing, plane separation, naming scheme, host backups, amendments to the standards | Identify, Protect | 1.1, 11.1, 11.2, 11.3, 11.4, 11.5, 12.2, 12.4 | |
+| `05-service-desk/` | Ticketing system, incident and change records, a ticket for every later lab | Respond | 17.3 | |
 | `10-endpoint/` | Windows 11 builds, unattend, imaging, reimage, patching | Protect | 2.1, 3.6, 4.1, 7.3, 7.4 | |
 | `20-server/` | Windows Server, AD DS, DNS, DHCP, GPO, patching, AD backup and restore | Protect | 4.1, 5.1, 6.1, 6.2, 7.3, 8.4, 11.2, 11.5 | |
 | `25-vulnerability/` | Vulnerability scanning, remediation tracking | Identify, Protect | 7.1, 7.2, 7.5, 7.7 | |
 | `30-identity/` | Entra tenant, Connect, hybrid join, Intune | Protect | 4.1, 6.3, 6.5, 6.7, 15.1 | |
+| `35-ot/` | OT segment, PLC simulation, Siemens and Allen-Bradley controllers, industrial protocols | Identify, Protect | 12.2 | NIST SP 800-82r3 |
 | `40-telemetry/` | Sysmon, WEF, SIEM install, ingest, parsing, filtering | Protect, Detect | 3.10, 8.1, 8.2, 8.3, 8.5, 8.8, 8.9, 8.10, 8.12 | NIST SP 800-137 |
 | `50-detection/` | Sigma, rule authoring, false-positive tuning | Detect | 8.11, 13.1 | MITRE ATT&CK |
 | `60-emulation/` | Atomic tests, sample detonation, ATT&CK ledger | Identify | none | MITRE ATT&CK, NIST SP 800-53 SC-44 |
@@ -67,6 +70,7 @@ link to the entry that chose it.
 - Filter for active runbooks: For repeatable configurations, use entries
   marked `status: complete` and `tier: L2` or `L3` that the layer index
   does not show as superseded.
+
 ## Reading an entry
  
 Each entry combines an architecture decision record (context, options
@@ -80,14 +84,13 @@ field.
  
 The tier field (L0–L3) records how far an entry's steps were validated:
  
-- L0: Architectural decision only. No executable steps.
-- L1: Commands and outcomes recorded from a single run on the named
-  hosts. Kept as a historical log rather than a repeatable runbook.
-- L2: Reproducible procedure with pre-checks, a captured baseline,
-  verification against that baseline, and a tested rollback.
-- L3: L2 procedure with explicit verification stops and captured
-  evidence at every step, used for destructive changes where rollback
-  requires more than restoring a snapshot.
+| Tier | Validation |
+|---|---|
+| L0 | Architectural decision only. No executable steps. |
+| L1 | Commands and outcomes recorded from a single run on the named hosts. Kept as a historical log rather than a repeatable runbook. |
+| L2 | Reproducible procedure with pre-checks, a captured baseline, verification against that baseline, and a tested rollback. |
+| L3 | L2 procedure with explicit verification stops and captured evidence at every step, used for destructive changes where rollback requires more than restoring a snapshot. |
+ 
 Each procedure was verified only on the lab systems its entry names. The
 entry's OBJECTIVE AND SCOPE section states where the procedure applies
 and where it does not.
@@ -109,6 +112,7 @@ The labs run as virtual guests on hardware shared with personal data.
   primary home network.
 - Lab plane: VMs, virtual networks/switches, and any lab-exclusive
   hardware.
+ 
 The environment is designed to be logically isolated so that no guest
 VM can communicate with the host plane beyond its own segment's DHCP
 and DNS. The 12.2 exit criterion in
