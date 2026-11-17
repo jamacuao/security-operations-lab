@@ -140,9 +140,11 @@ controls: []
 7.  REFERENCES
 
     o  RFC 1918, Address Allocation for Private Internets
+       https://www.rfc-editor.org/rfc/rfc1918
 
     o  CIS Controls v8.1, 12.2 Establish and Maintain a Secure Network
        Architecture
+       https://cas.docs.cisecurity.org/en/latest/source/Controls12/#122-establish-and-maintain-a-secure-network-architecture
 
     o  conventions.md, Naming and addressing
 ```
